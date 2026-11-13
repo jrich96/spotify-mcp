@@ -23,6 +23,7 @@ from spotipy import SpotifyException
 
 from spotify_mcp.fastmcp_server import (
     MAX_PLAYLIST_TRACKS_PER_CALL,
+    MAX_SHUFFLE_MOVES_PER_CALL,
     PlaybackState,
     Playlist,
     RemovalConfirmation,
@@ -76,6 +77,7 @@ from spotify_mcp.fastmcp_server import (
     save_shows,
     save_tracks,
     search_music,
+    shuffle_playlist,
     unfollow_artists,
     unfollow_playlist,
     update_playlist_details,
@@ -1173,6 +1175,197 @@ class TestReorderPlaylist:
 
         with pytest.raises(ValueError):
             reorder_playlist("pl1", range_start=0, insert_before=1)
+
+
+class FakePlaylist:
+    """A playlist held in memory that applies reorder requests like Spotify does.
+
+    Stands in for the reorder endpoint so the tests check the order a shuffle
+    actually produces, not just the requests it sends. `legacy` serves only the
+    pre-2026 /tracks route and rejects /items the way a legacy-regime app sees it.
+    """
+
+    def __init__(self, size: int, *, legacy: bool = False, fail_on: int | None = None):
+        self.order = list(range(size))
+        self.legacy = legacy
+        self.fail_on = fail_on
+        self.payloads: list[dict] = []
+        self.paths: list[str] = []
+
+    def put(self, path: str, payload: dict) -> dict:
+        self.paths.append(path)
+        if self.legacy and path.endswith("/items"):
+            raise SpotifyException(404, -1, "Not found")
+        if self.fail_on is not None and len(self.payloads) == self.fail_on:
+            raise SpotifyException(
+                429, -1, "API rate limit exceeded", headers={"Retry-After": "30"}
+            )
+        self.payloads.append(payload)
+        start, before = payload["range_start"], payload["insert_before"]
+        track = self.order.pop(start)
+        # Spotify counts insert_before against the list as it was before the move.
+        self.order.insert(before if before < start else before - 1, track)
+        return {"snapshot_id": f"s{len(self.payloads)}"}
+
+
+@pytest.fixture
+def no_shuffle_delay(monkeypatch):
+    monkeypatch.setattr("spotify_mcp.fastmcp_server._SHUFFLE_MOVE_DELAY_S", 0)
+
+
+def seed_shuffle(monkeypatch, seed: int = 7) -> None:
+    import random
+
+    monkeypatch.setattr("spotify_mcp.fastmcp_server._shuffle_rng", random.Random(seed))
+
+
+@pytest.mark.usefixtures("no_shuffle_delay")
+class TestShufflePlaylist:
+    def _setup(self, mock_spotify_api, playlist: FakePlaylist) -> None:
+        mock_spotify_api.playlist.return_value = {
+            "tracks": {"total": len(playlist.order)}
+        }
+        mock_spotify_api._put.side_effect = playlist.put
+
+    async def test_shuffles_every_track_in_place(self, mock_spotify_api, monkeypatch):
+        seed_shuffle(monkeypatch)
+        playlist = FakePlaylist(40)
+        self._setup(mock_spotify_api, playlist)
+
+        result = await shuffle_playlist("pl1")
+
+        assert result.status == "success"
+        assert result.next_start is None
+        assert result.total == 40
+        # Every track is still there exactly once, and the order changed.
+        assert sorted(playlist.order) == list(range(40))
+        assert playlist.order != list(range(40))
+        assert result.moves == len(playlist.payloads)
+        assert all(p["range_start"] > p["insert_before"] for p in playlist.payloads)
+
+    async def test_chains_snapshot_ids(self, mock_spotify_api, monkeypatch):
+        seed_shuffle(monkeypatch)
+        playlist = FakePlaylist(10)
+        self._setup(mock_spotify_api, playlist)
+
+        result = await shuffle_playlist("pl1")
+
+        # The first move has no snapshot to guard; each later one uses the last.
+        assert "snapshot_id" not in playlist.payloads[0]
+        for i, payload in enumerate(playlist.payloads[1:], start=1):
+            assert payload["snapshot_id"] == f"s{i}"
+        assert result.snapshot_id == f"s{len(playlist.payloads)}"
+
+    async def test_order_is_uniformly_random(self, mock_spotify_api, monkeypatch):
+        # All 6 orders of 3 tracks should come up about equally often. With 6000
+        # runs each expects 1000; a biased algorithm misses by hundreds.
+        seed_shuffle(monkeypatch, seed=1)
+        counts: dict[tuple[int, ...], int] = {}
+        for _ in range(6000):
+            playlist = FakePlaylist(3)
+            self._setup(mock_spotify_api, playlist)
+            await shuffle_playlist("pl1")
+            key = tuple(playlist.order)
+            counts[key] = counts.get(key, 0) + 1
+
+        assert len(counts) == 6
+        assert all(850 < n < 1150 for n in counts.values()), counts
+
+    async def test_stops_at_max_moves_and_resumes(self, mock_spotify_api, monkeypatch):
+        seed_shuffle(monkeypatch)
+        playlist = FakePlaylist(30)
+        self._setup(mock_spotify_api, playlist)
+
+        first = await shuffle_playlist("pl1", max_moves=5)
+
+        assert first.status == "in_progress"
+        assert first.moves == 5
+        assert first.next_start is not None
+        settled = playlist.order[: first.next_start]
+
+        second = await shuffle_playlist("pl1", start=first.next_start)
+
+        assert second.status == "success"
+        assert second.next_start is None
+        # Positions before the resume point are never touched again.
+        assert playlist.order[: first.next_start] == settled
+        assert sorted(playlist.order) == list(range(30))
+        assert all(
+            p["insert_before"] >= first.next_start for p in playlist.payloads[5:]
+        )
+
+    async def test_legacy_regime_uses_tracks_route(self, mock_spotify_api, monkeypatch):
+        seed_shuffle(monkeypatch)
+        playlist = FakePlaylist(12, legacy=True)
+        self._setup(mock_spotify_api, playlist)
+
+        result = await shuffle_playlist("pl1")
+
+        assert result.status == "success"
+        assert sorted(playlist.order) == list(range(12))
+        # One rejected /items probe, then every move on the legacy route.
+        assert playlist.paths[0] == "playlists/pl1/items"
+        assert set(playlist.paths[1:]) == {"playlists/pl1/tracks"}
+
+    async def test_failure_midway_names_resume_point_without_retrying(
+        self, mock_spotify_api, monkeypatch
+    ):
+        seed_shuffle(monkeypatch)
+        playlist = FakePlaylist(30, fail_on=3)
+        self._setup(mock_spotify_api, playlist)
+
+        with pytest.raises(ValueError, match=r"Resume with start=\d+") as err:
+            await shuffle_playlist("pl1")
+
+        assert "rate" in str(err.value).lower()
+        assert len(playlist.payloads) == 3
+        # One failed request, no retry.
+        assert len(playlist.paths) == 4
+        assert sorted(playlist.order) == list(range(30))
+
+    async def test_failure_on_first_move_is_a_plain_spotify_error(
+        self, mock_spotify_api, monkeypatch
+    ):
+        seed_shuffle(monkeypatch)
+        playlist = FakePlaylist(30, fail_on=0)
+        self._setup(mock_spotify_api, playlist)
+
+        with pytest.raises(ValueError) as err:
+            await shuffle_playlist("pl1")
+
+        assert "Resume" not in str(err.value)
+        assert playlist.order == list(range(30))
+
+    async def test_nothing_to_do_past_the_end(self, mock_spotify_api, monkeypatch):
+        seed_shuffle(monkeypatch)
+        playlist = FakePlaylist(5)
+        self._setup(mock_spotify_api, playlist)
+
+        result = await shuffle_playlist("pl1", start=10)
+
+        assert result.status == "success"
+        assert result.moves == 0
+        mock_spotify_api._put.assert_not_called()
+
+    async def test_uses_items_total_when_metadata_is_stripped(
+        self, mock_spotify_api, monkeypatch
+    ):
+        seed_shuffle(monkeypatch)
+        playlist = FakePlaylist(8)
+        self._setup(mock_spotify_api, playlist)
+        mock_spotify_api.playlist.return_value = {}
+        mock_spotify_api._get.return_value = {"items": [], "total": 8}
+
+        result = await shuffle_playlist("pl1")
+
+        assert result.total == 8
+        assert sorted(playlist.order) == list(range(8))
+
+    @pytest.mark.parametrize("max_moves", [0, MAX_SHUFFLE_MOVES_PER_CALL + 1])
+    async def test_max_moves_out_of_range_raises(self, mock_spotify_api, max_moves):
+        with pytest.raises(ValueError, match="max_moves"):
+            await shuffle_playlist("pl1", max_moves=max_moves)
+        mock_spotify_api._put.assert_not_called()
 
 
 class TestListPlaylists:

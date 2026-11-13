@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import random
 import time
 from importlib.metadata import version
 from typing import TYPE_CHECKING, Annotated, cast
@@ -414,6 +415,18 @@ class ActionResult(BaseModel):
 
     status: str
     message: str
+    snapshot_id: str | None = None
+
+
+class ShuffleResult(BaseModel):
+    """Progress of an in-place playlist shuffle."""
+
+    status: str
+    message: str
+    total: int
+    moves: int
+    # Pass back as `start` to keep shuffling; None once every position is final.
+    next_start: int | None = None
     snapshot_id: str | None = None
 
 
@@ -1493,6 +1506,133 @@ def reorder_playlist(
             f"to before position {insert_before}"
         ),
         snapshot_id=result.get("snapshot_id") if result else None,
+    )
+
+
+# A shuffle costs one reorder request per moved track, so each call caps its writes
+# and hands back a position to resume from rather than running for many minutes.
+MAX_SHUFFLE_MOVES_PER_CALL = 1000
+DEFAULT_SHUFFLE_MOVES = 250
+# Pause between moves so a long shuffle doesn't burst into Spotify's rate limit.
+_SHUFFLE_MOVE_DELAY_S = 0.1
+# Module-level so tests can swap in a seeded generator.
+_shuffle_rng: random.Random = random.SystemRandom()
+
+
+@mcp.tool(
+    title="Shuffle Playlist",
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        # Replaces the existing track order, so clients should confirm it.
+        destructive_hint=True,
+        idempotent_hint=False,
+        open_world_hint=True,
+    ),
+)
+@log_tool_execution
+async def shuffle_playlist(
+    playlist_id: str,
+    start: Offset = 0,
+    max_moves: Annotated[
+        int, Field(ge=1, le=MAX_SHUFFLE_MOVES_PER_CALL)
+    ] = DEFAULT_SHUFFLE_MOVES,
+    ctx: Context | None = None,
+) -> ShuffleResult:
+    """Randomly reorder a playlist in place, one track move per request.
+
+    Tracks are only moved, never removed and re-added, so added dates survive and
+    a failure leaves every track in the playlist.
+
+    Args:
+        start: Position to continue from; positions before it are final
+        max_moves: Most moves (API requests) this call makes, 1-1000
+
+    Call again with `start=next_start` until it is null; the finished order is
+    uniformly random however many calls it takes. An error names the position
+    to resume from. Avoid editing the playlist elsewhere until it finishes.
+    """
+    if not 1 <= max_moves <= MAX_SHUFFLE_MOVES_PER_CALL:
+        raise ValueError(
+            f"max_moves must be between 1 and {MAX_SHUFFLE_MOVES_PER_CALL}"
+        )
+    if start < 0:
+        raise ValueError("start must be >= 0")
+
+    playlist_info = await asyncio.to_thread(
+        spotify_client.playlist, playlist_id, fields="tracks.total"
+    )
+    total = await asyncio.to_thread(
+        _total_tracks, playlist_id, (playlist_info.get("tracks") or {}).get("total")
+    )
+    if total is None:
+        raise ValueError(
+            "Spotify did not report how many tracks this playlist holds, "
+            "so it cannot be shuffled"
+        )
+
+    # Fisher-Yates by moves: each step brings a uniformly chosen track from the
+    # unshuffled tail to `position`. Earlier positions are never touched again,
+    # which is what makes a resumed shuffle exactly as random as a single run.
+    last = total - 1  # the final position has only one candidate left
+    position = start
+    moves = 0
+    snapshot: str | None = None
+    while position < last and moves < max_moves:
+        pick = _shuffle_rng.randrange(position, total)
+        if pick != position:
+            try:
+                result = await asyncio.to_thread(
+                    spotify_api.playlist_reorder_items,
+                    spotify_client,
+                    playlist_id,
+                    range_start=pick,
+                    insert_before=position,
+                    snapshot_id=snapshot,
+                )
+            except SpotifyException as e:
+                if moves == 0:
+                    raise
+                # No retry, including on 429: quota is shared per developer account.
+                raise ModelVisibleError(
+                    f"{convert_spotify_error(e)} Made {moves} move(s) first; "
+                    f"positions before {position} are final. "
+                    f"Resume with start={position}."
+                ) from e
+            snapshot = (result or {}).get("snapshot_id") or snapshot
+            moves += 1
+            if ctx is not None and moves % 10 == 0:
+                await ctx.report_progress(
+                    position + 1 - start,
+                    last - start,
+                    message=f"Shuffled through position {position}",
+                )
+            if _SHUFFLE_MOVE_DELAY_S:
+                await asyncio.sleep(_SHUFFLE_MOVE_DELAY_S)
+        position += 1
+
+    if position >= last:
+        message = (
+            f"Shuffled all {total} tracks"
+            if start == 0
+            else f"Shuffled positions {start}-{max(last, start)}; the playlist is done"
+        )
+        return ShuffleResult(
+            status="success",
+            message=message,
+            total=total,
+            moves=moves,
+            snapshot_id=snapshot,
+        )
+    return ShuffleResult(
+        status="in_progress",
+        message=(
+            f"Shuffled positions {start}-{position - 1} of {total}; "
+            f"call again with start={position}"
+        ),
+        total=total,
+        moves=moves,
+        next_start=position,
+        snapshot_id=snapshot,
     )
 
 

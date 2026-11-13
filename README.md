@@ -68,9 +68,10 @@ Do not automatically delete the auth cache.
 
 ## Features
 
-48 tools, six resources (user, playback, track, playlist, artist, album), and five prompts.
-Tools provide typed outputs and behavior annotations; large playlist reads report progress.
-Playlist removal asks for confirmation where supported, reordering uses snapshot guards,
+49 tools, six resources (user, playback, track, playlist, artist, album), and five prompts.
+Tools provide typed outputs and behavior annotations; large playlist reads and shuffles
+report progress. Playlist removal asks for confirmation where supported, reordering and
+shuffling use snapshot guards,
 and playback control attempts best-effort read-after-write confirmation, not guaranteed success.
 
 ### Tools
@@ -95,6 +96,7 @@ and playback control attempts best-effort read-after-write confirmation, not gua
 | `add_tracks_to_playlist` | Add up to 100 tracks or episodes |
 | `remove_tracks_from_playlist` | Remove tracks or episodes with confirmation where supported |
 | `reorder_playlist` | Move a block of tracks |
+| `shuffle_playlist` | Randomly reorder a playlist in place; continue from `next_start` |
 | `follow_playlist` | Follow (save) a playlist |
 | `unfollow_playlist` | Unfollow a playlist, including your own |
 | `get_saved_tracks` | Read Liked Songs with pagination |
