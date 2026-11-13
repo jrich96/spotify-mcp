@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+- New `shuffle_playlist` tool randomly reorders a playlist in place. It moves tracks one
+  request at a time and never removes and re-adds them, so added dates survive and a
+  failure leaves every track in the playlist. Each call makes at most `max_moves` moves
+  (default 250, up to 1000) and returns `next_start`; pass it back as `start` until it is
+  null. The finished order is uniformly random however many calls it takes. It does not
+  retry a 429; the error names the position to resume from.
+
 ## 2026-11-07 — 0.9.2
 - `get_playlist_tracks` rejects `limit` below 1 before calling Spotify. A zero or negative
   limit read nothing but returned the same `next_offset`, so a client following it looped
