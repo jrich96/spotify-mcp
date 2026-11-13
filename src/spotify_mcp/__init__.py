@@ -7,7 +7,9 @@ from .fastmcp_server import mcp
 def main() -> None:
     """Run the server over stdio."""
     # Exit quietly when the client disconnects or the user presses Ctrl+C.
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    # SIGPIPE does not exist on Windows.
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     try:
         mcp.run()
     except (BrokenPipeError, KeyboardInterrupt):
